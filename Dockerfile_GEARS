@@ -1,0 +1,98 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl bzip2 ca-certificates git wget \
+      libgomp1 libstdc++6 \
+      libhdf5-dev libffi-dev \
+      tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install micromamba (pinned release to avoid CDN instability)
+RUN curl -fsSL --retry 5 --retry-delay 3 -L \
+      https://github.com/mamba-org/micromamba-releases/releases/download/2.0.5-0/micromamba-linux-64 \
+      -o /usr/local/bin/micromamba \
+    && chmod +x /usr/local/bin/micromamba
+ENV MAMBA_ROOT_PREFIX=/opt/conda
+ENV PATH="/opt/conda/bin:${PATH}"
+
+RUN micromamba create -y -n gears python=3.11 -c conda-forge \
+    && micromamba clean --all --yes
+
+SHELL ["micromamba", "run", "-n", "gears", "/bin/bash", "-c"]
+
+WORKDIR /workspace
+
+# ── 1. PyTorch 2.6 with CUDA 12.4 ────────────────────────────────────────────
+RUN pip install --no-cache-dir \
+      torch==2.6.0 torchvision==0.21.0 \
+      --index-url https://download.pytorch.org/whl/cu124
+
+# ── 2. PyTorch Geometric + CUDA scatter/sparse extensions ─────────────────────
+#    Must match torch-2.6.0+cu124; extensions needed for the GO graph GNN
+RUN pip install --no-cache-dir \
+      torch-scatter torch-sparse torch-cluster torch-spline-conv \
+      -f https://data.pyg.org/whl/torch-2.6.0+cu124.html \
+    && pip install --no-cache-dir torch-geometric
+
+# ── 3. GEARS Python dependencies (pinned as per requirements.txt) ─────────────
+RUN pip install --no-cache-dir \
+      "numpy==1.26.4" \
+      "pandas==2.2.2" \
+      "tqdm==4.66.5" \
+      "scikit-learn==1.5.1" \
+      "scanpy==1.10.2" \
+      "networkx==3.3" \
+      "dcor" \
+      "scipy==1.14.1" \
+      "matplotlib" \
+      "seaborn"
+
+# ── 4. Install GEARS from GitHub + patch newer scipy/pandas incompatibility ───
+#    GEARS was written for older scipy which accepted pandas Series as boolean
+#    sparse-matrix indices. Newer scipy requires a numpy array. Add .values.
+RUN git clone --depth 1 https://github.com/snap-stanford/GEARS.git /workspace/GEARS \
+ && pip install --no-cache-dir --no-deps -e /workspace/GEARS \
+ && sed -i \
+      "s/self\.adata\.X\[self\.adata\.obs\.condition == 'ctrl'\]/self.adata.X[(self.adata.obs.condition == 'ctrl').values]/g" \
+      /workspace/GEARS/gears/gears.py
+
+# ── 5. Pre-download Harvard Dataverse reference files ─────────────────────────
+#    Three files are fetched at runtime by GEARS if not already present:
+#      6153417  → gene2go_all.pkl          (PertData.__init__)
+#      6934320  → essential_all_data_pert_genes.pkl  (set_pert_genes)
+#      6934319  → go_essential_all.tar.gz  (model_initialize, GO network)
+#    Pre-cache all three at build time so compute nodes need no internet.
+RUN mkdir -p /workspace/gears_data/go_essential_all \
+    && wget -q --retry-connrefused --waitretry=5 --tries=5 \
+         -O /workspace/gears_data/gene2go_all.pkl \
+         'https://dataverse.harvard.edu/api/access/datafile/6153417' \
+    && wget -q --retry-connrefused --waitretry=5 --tries=5 \
+         -O /workspace/gears_data/essential_all_data_pert_genes.pkl \
+         'https://dataverse.harvard.edu/api/access/datafile/6934320' \
+    && wget -q --retry-connrefused --waitretry=5 --tries=5 \
+         -O /workspace/gears_data/go_essential_all.tar.gz \
+         'https://dataverse.harvard.edu/api/access/datafile/6934319' \
+    && tar -xzf /workspace/gears_data/go_essential_all.tar.gz \
+         -C /workspace/gears_data \
+    && rm /workspace/gears_data/go_essential_all.tar.gz
+
+# ── 6. Evaluation — cell-eval + pdex (same as CellFlow/scDFM images) ─────────
+RUN pip install --no-cache-dir "pdex==0.1.28" \
+ && pip install --no-cache-dir \
+      "cell-eval @ git+https://github.com/ArcInstitute/cell-eval@v0.5.42"
+
+# ── 7. W&B ────────────────────────────────────────────────────────────────────
+RUN pip install --no-cache-dir wandb
+
+# ── Verify key imports ────────────────────────────────────────────────────────
+RUN python -c "import torch; print('torch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" \
+ && python -c "import torch_geometric; print('torch_geometric:', torch_geometric.__version__)" \
+ && python -c "import gears; print('gears OK')" \
+ && python -c "import cell_eval; print('cell_eval OK')"
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["micromamba", "run", "-n", "gears", "bash"]
